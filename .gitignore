@@ -1,0 +1,15 @@
+# Datasets (download separately, too large for GitHub)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Model / embedding artifacts
+*.pt
+*.npy
+*.ckpt
