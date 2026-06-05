@@ -11,21 +11,24 @@ M7: LLM 邊級關係推理打分器
 
 評估方式：對 test split 的正邊 + 負邊打分，直接算 AUC / AP。
 快取：data/{tag}_llm_pairwise_scores.json，key = "min,max"，支援斷點續跑。
+
+模型：本地以 HuggingFace transformers 載入 meta-llama/Llama-3.1-8B-Instruct，
+優先跑 GPU（CUDA），偵測不到才退回 CPU。
+注意：此模型為 gated repo，須先在 HF 網站接受授權並登入
+（huggingface-cli login，或設環境變數 HF_TOKEN）。
 """
 
 import json
 import os
 import re
-import time
 
 
 # ── 設定 ──────────────────────────────────────────────────────────────
-# Groq 模型：70b 推理品質遠勝 8b。若此模型在你的帳號不可用，
-# 改成 "llama-3.1-8b-instant"（較快但判斷較粗）。
-MODEL       = "llama-3.3-70b-versatile"
-BATCH       = 12      # 一次打分幾個 pair（攤平 system prompt 成本、省 token）
-TEMPERATURE = 0.0     # 打分要可重現、可校準
-MAX_CHARS   = 180     # 每篇摘要截斷長度（省 token）
+MODEL       = "meta-llama/Llama-3.1-8B-Instruct"
+BATCH       = 12      # 一次打分幾個 pair（攤平 system prompt 成本）
+TEMPERATURE = 0.0     # 打分要可重現、可校準（temperature=0 → greedy decoding）
+MAX_CHARS   = 180     # 每篇摘要截斷長度
+MAX_NEW_TOKENS = 768  # 一個 batch 的 JSON 陣列輸出上限
 
 
 # ── Prompt（system）──────────────────────────────────────────────────
@@ -97,14 +100,11 @@ def score_pairs(pairs, texts, tag, years=None, log_prefix="[llm_pairwise]"):
             todo.append((u, v))
 
     if todo:
-        api_key = os.environ.get("GROQ_API_KEY")
-        if not api_key:
-            raise RuntimeError("llm_pairwise 需要 GROQ_API_KEY")
-        from groq import Groq
-        client = Groq(api_key=api_key)
+        model, tokenizer, device = _get_model()
 
         n_batch = (len(todo) + BATCH - 1) // BATCH
-        print(f"{log_prefix} 需打分 {len(todo)} 個新 pair，共 {n_batch} batch（model={MODEL}）")
+        print(f"{log_prefix} 需打分 {len(todo)} 個新 pair，共 {n_batch} batch"
+              f"（model={MODEL}, device={device}）")
 
         for b in range(n_batch):
             lo, hi = b * BATCH, min((b + 1) * BATCH, len(todo))
@@ -113,17 +113,54 @@ def score_pairs(pairs, texts, tag, years=None, log_prefix="[llm_pairwise]"):
                 _format_pair(i, u, v, texts, years)
                 for i, (u, v) in enumerate(batch)
             )
-            scores = _call_batch(client, pairs_block, len(batch), log_prefix, b)
+            scores = _call_batch(model, tokenizer, device,
+                                 pairs_block, len(batch), log_prefix, b)
             for (u, v), s in zip(batch, scores):
                 cache[_pair_key(u, v)] = s
 
-            time.sleep(1.5)  # 控制 RPM
             if (b + 1) % 10 == 0 or hi == len(todo):
                 _save(cache_path, cache)
 
         _save(cache_path, cache)
 
     return [cache[_pair_key(u, v)] for u, v in pairs]
+
+
+# ── 模型載入（單例，整個 process 只載一次）────────────────────────────
+_MODEL_CACHE = {}
+
+
+def _get_model():
+    """延遲載入 Llama-3.1-8B-Instruct。優先 CUDA，否則退回 CPU。"""
+    if "bundle" in _MODEL_CACHE:
+        return _MODEL_CACHE["bundle"]
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    token   = os.environ.get("HF_TOKEN")  # gated repo 需要；None 時靠 CLI 登入
+    use_gpu = torch.cuda.is_available()
+    device  = "cuda" if use_gpu else "cpu"
+    dtype   = torch.bfloat16 if use_gpu else torch.float32
+    if not use_gpu:
+        print("[llm_pairwise] 警告：偵測不到 CUDA，將以 CPU 執行 8B 模型（會非常慢）。")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL, token=token)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL,
+        token=token,
+        torch_dtype=dtype,
+        device_map="auto" if use_gpu else None,
+    )
+    if not use_gpu:
+        model = model.to(device)
+    model.eval()
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    _MODEL_CACHE["bundle"] = (model, tokenizer, device)
+    return _MODEL_CACHE["bundle"]
 
 
 # ── 內部工具 ──────────────────────────────────────────────────────────
@@ -150,33 +187,44 @@ def _clip01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 
-def _call_batch(client, pairs_block, n_pairs, log_prefix, b):
-    """呼叫 Groq，回傳長度 = n_pairs 的分數（解析失敗的填 0.5 中性值）"""
+def _call_batch(model, tokenizer, device, pairs_block, n_pairs, log_prefix, b):
+    """本地推理一個 batch，回傳長度 = n_pairs 的分數（解析失敗填 0.5 中性值）"""
+    import torch
+
     user_msg = (
         f"NOW SCORE THESE PAIRS:\n{pairs_block}\n\n"
         f"Output ONLY the JSON array of {n_pairs} objects."
     )
-    for attempt in range(3):
-        try:
-            resp = client.chat.completions.create(
-                model=MODEL,
-                temperature=TEMPERATURE,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_msg},
-                ],
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": user_msg},
+    ]
+    try:
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        ).to(model.device)
+
+        with torch.no_grad():
+            out = model.generate(
+                inputs,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=TEMPERATURE > 0,
+                temperature=TEMPERATURE if TEMPERATURE > 0 else None,
+                pad_token_id=tokenizer.pad_token_id,
             )
-            raw    = resp.choices[0].message.content
-            scores = _parse_scores(raw, n_pairs)
-            filled = sum(1 for s in scores if s is not None)
-            print(f"{log_prefix} batch {b:4d} | {filled}/{n_pairs} 筆")
-            return [s if s is not None else 0.5 for s in scores]
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(4 * (attempt + 1))
-            else:
-                print(f"{log_prefix} batch {b:4d} | 失敗: {e}")
-                return [0.5] * n_pairs
+        # 只取新生成的部分（去掉 prompt）
+        gen = out[0][inputs.shape[1]:]
+        raw = tokenizer.decode(gen, skip_special_tokens=True)
+
+        scores = _parse_scores(raw, n_pairs)
+        filled = sum(1 for s in scores if s is not None)
+        print(f"{log_prefix} batch {b:4d} | {filled}/{n_pairs} 筆")
+        return [s if s is not None else 0.5 for s in scores]
+    except Exception as e:
+        print(f"{log_prefix} batch {b:4d} | 失敗: {e}")
+        return [0.5] * n_pairs
 
 
 def _parse_scores(raw: str, n_pairs: int):

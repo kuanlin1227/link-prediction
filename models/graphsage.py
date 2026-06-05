@@ -10,7 +10,9 @@ GraphSAGE link prediction 模型
 import torch
 import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, confusion_matrix, cohen_kappa_score,
+)
 
 
 class LinkSAGE(torch.nn.Module):
@@ -52,10 +54,14 @@ def train_epoch(model, optimizer, train_data, device) -> float:
 
 
 @torch.no_grad()
-def evaluate(model, train_data, eval_data, device) -> dict:
+def evaluate(model, train_data, eval_data, device, threshold: float = 0.5) -> dict:
     """
     使用訓練集的 edge_index 做 message passing，
-    但在 eval_data 的邊上計算 AUC / AP。
+    但在 eval_data 的邊上計算各項指標。
+
+    AUC / AP 不需 threshold（用連續分數計算）；
+    混淆矩陣 (TN/FP/FN/TP) 與其衍生指標 (accuracy/precision/recall/f1)
+    則以 sigmoid 機率 >= threshold（預設 0.5）判為「有連結」。
     """
     model.eval()
 
@@ -67,7 +73,24 @@ def evaluate(model, train_data, eval_data, device) -> dict:
     z    = model.encode(x, edge_index)
     pred = model.decode(z, eli).sigmoid().cpu().numpy()
 
+    # 以 threshold 二值化後算混淆矩陣（labels=[0,1] 確保固定為 2x2）
+    pred_label = (pred >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(labels, pred_label, labels=[0, 1]).ravel()
+
+    eps       = 1e-12
+    accuracy  = (tp + tn) / (tp + tn + fp + fn + eps)
+    precision = tp / (tp + fp + eps)
+    recall    = tp / (tp + fn + eps)
+    f1        = 2 * precision * recall / (precision + recall + eps)
+    kappa     = cohen_kappa_score(labels, pred_label)
+
     return {
-        'auc': roc_auc_score(labels, pred),
-        'ap':  average_precision_score(labels, pred),
+        'auc':       roc_auc_score(labels, pred),
+        'ap':        average_precision_score(labels, pred),
+        'tn': int(tn), 'fp': int(fp), 'fn': int(fn), 'tp': int(tp),
+        'accuracy':  accuracy,
+        'precision': precision,
+        'recall':    recall,
+        'f1':        f1,
+        'kappa':     kappa,
     }

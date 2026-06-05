@@ -299,7 +299,8 @@ def main():
                     run_results.append(metrics)
                     print(f"  [{feature_name}] sparsity={sparsity:.0%} "
                           f"run={run_id+1}/{RUNS}  "
-                          f"AUC={metrics['auc']:.4f}  AP={metrics['ap']:.4f}")
+                          f"AUC={metrics['auc']:.4f}  AP={metrics['ap']:.4f}  "
+                          f"F1={metrics['f1']:.4f}")
                 except Exception as e:
                     print(f"  [{feature_name}] sparsity={sparsity:.0%} "
                           f"run={run_id+1} FAILED: {e}")

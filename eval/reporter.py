@@ -38,16 +38,37 @@ class Reporter:
         self.records = []
 
     def add(self, feature_name: str, sparsity: float, run_results: list):
-        aucs = [r['auc'] for r in run_results]
-        aps  = [r['ap']  for r in run_results]
-        self.records.append({
-            'feature':      feature_name,
-            'sparsity':     sparsity,
-            'auc_mean':     np.mean(aucs),
-            'auc_std':      np.std(aucs),
-            'ap_mean':      np.mean(aps),
-            'ap_std':       np.std(aps),
-        })
+        def col(key):
+            return [r[key] for r in run_results if key in r]
+
+        rec = {
+            'feature':  feature_name,
+            'sparsity': sparsity,
+            'auc_mean': np.mean(col('auc')), 'auc_std': np.std(col('auc')),
+            'ap_mean':  np.mean(col('ap')),  'ap_std':  np.std(col('ap')),
+        }
+        # 衍生指標：mean ± std（pairwise 等沒提供時填 NaN）
+        for key in ('accuracy', 'precision', 'recall', 'f1', 'kappa'):
+            vals = col(key)
+            rec[f'{key}_mean'] = np.mean(vals) if vals else np.nan
+            rec[f'{key}_std']  = np.std(vals)  if vals else np.nan
+        # 混淆矩陣計數：取各 run 平均
+        for key in ('tp', 'fp', 'fn', 'tn'):
+            vals = col(key)
+            rec[key] = np.mean(vals) if vals else np.nan
+        self.records.append(rec)
+
+    @staticmethod
+    def _fmt(mean, std):
+        if mean is None or (isinstance(mean, float) and np.isnan(mean)):
+            return "-"
+        return f"{mean:.4f} ± {std:.4f}"
+
+    @staticmethod
+    def _fmt_count(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return "-"
+        return f"{v:.1f}"
 
     def to_dataframe(self) -> pd.DataFrame:
         rows = []
@@ -57,6 +78,15 @@ class Reporter:
                 '訓練邊比例': SPARSITY_LABELS.get(r['sparsity'], str(r['sparsity'])),
                 'AUC':        f"{r['auc_mean']:.4f} ± {r['auc_std']:.4f}",
                 'AP':         f"{r['ap_mean']:.4f} ± {r['ap_std']:.4f}",
+                'F1':         self._fmt(r.get('f1_mean'),        r.get('f1_std')),
+                'Precision':  self._fmt(r.get('precision_mean'), r.get('precision_std')),
+                'Recall':     self._fmt(r.get('recall_mean'),    r.get('recall_std')),
+                'Accuracy':   self._fmt(r.get('accuracy_mean'),  r.get('accuracy_std')),
+                'Kappa':      self._fmt(r.get('kappa_mean'),     r.get('kappa_std')),
+                'TP':         self._fmt_count(r.get('tp')),
+                'FP':         self._fmt_count(r.get('fp')),
+                'FN':         self._fmt_count(r.get('fn')),
+                'TN':         self._fmt_count(r.get('tn')),
             })
         return pd.DataFrame(rows)
 
