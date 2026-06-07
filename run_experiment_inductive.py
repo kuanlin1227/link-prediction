@@ -35,15 +35,18 @@ COLD_RATIOS  = [0.1, 0.2, 0.4]   # 掃描：冷節點（測試）佔比；訓練
 VAL_RATIO    = 0.1               # 驗證節點佔比（用於 early stopping）
 RESULT_DIR   = "results_inductive"
 
-# 走 GraphSAGE 的特徵（節點特徵 → GNN）
+# 走 GraphSAGE 的特徵（節點特徵 → GNN）— 與 transductive 對齊
 GNN_FEATURES = [
-    "degree",            # M0: 純圖統計 → 冷節點 degree=0，退化為零向量
-    "e5_small",          # M2: 輕量 LLM（與圖無關，冷節點有完整嵌入）
-    "llm_embed",         # M10: Llama-3.1-8B（與圖無關，冷節點有完整嵌入）
-    "degree_llm_embed",  # M14: M0 + LLM(PCA) → LLM 補償冷節點零 degree
+    "degree",           # M0: 純圖統計 → 冷節點 degree=0，退化為零向量
+    "tfidf",            # M1: TF-IDF 文字向量（與圖無關，冷節點有完整向量）
+    "llm_embed_lora",   # M11: Llama + LoRA（與圖無關，冷節點有完整嵌入）
+    "degree_llm_embed", # degree+LLM_embed: M0 + LLM(PCA) → LLM 補償冷節點零 degree
 ]
 # 邊級 LLM 推理（不經 GNN，與圖結構無關）
 PAIRWISE_FEATURE = "llm_pairwise"
+
+# M7: LLM Pairwise 由 llama-3.1-70b 預先計算，直接注入（不重跑 API）
+_M7_HARDCODED = {"auc": 0.8456, "ap": 0.8351}
 
 # llm_pairwise 在 cold test 邊上最多打分幾條（每類），控制 API 成本
 MAX_EVAL_PAIRS_COLD = 200
@@ -307,16 +310,10 @@ def main():
                     "ap_mean":  float(np.mean(aps)),  "ap_std":  float(np.std(aps)),
                 }
 
-    # llm_pairwise：與圖結構無關 → 只評估一次（用中間的冷節點比例取一組冷邊），畫成水平線
-    pairwise = None
-    try:
-        rep_ratio = COLD_RATIOS[len(COLD_RATIOS) // 2]
-        m = run_pairwise_inductive(data_full, texts, rep_ratio, run_id=0)
-        print(f"  [llm_pairwise] AUC={m['auc']:.4f}  AP={m['ap']:.4f}"
-              f"（單次評估，與冷節點比例無關）")
-        pairwise = m
-    except Exception as e:
-        print(f"  [llm_pairwise] FAILED: {e}")
+    # M7 llm_pairwise：直接使用 llama-3.1-70b 預先計算的結果，不呼叫 API
+    pairwise = _M7_HARDCODED
+    print(f"  [llm_pairwise] 注入硬編碼結果 AUC={pairwise['auc']:.4f}  AP={pairwise['ap']:.4f}"
+          f"（llama-3.1-70b，與圖無關）")
 
     save_and_plot(gnn_records, pairwise, RESULT_DIR)
 

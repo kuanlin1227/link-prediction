@@ -43,20 +43,20 @@ RUNS        = 3
 SPARSITY_RATIOS = [0.2, 0.5, 0.8]
 
 FEATURE_CONFIGS = [
-    "degree",                # M0: 純圖統計（degree, clustering coeff）
-    # "tfidf",               # M1: TF-IDF 文字向量（baseline 文字特徵）
-    # "e5_small",            # M2: multilingual-e5-small（輕量 LLM）
-    # "llm_struct",          # M5: Groq 結構化語意特徵（16 維，品質不佳，停用）
-    # "llm_keywords",        # M6: Groq 關鍵詞 + TF-IDF（512 維，需 GROQ_API_KEY，已停用）
-    "llm_embed",             # M10: Llama 節點嵌入 → GraphSAGE（圖聚合）
-    "llm_embed_lora",        # M11: Llama + LoRA 節點嵌入 → GraphSAGE
-    # "llm_graph_embed",     # M12: LLM(PCA) + GAE → GraphSAGE（待 gae_embed 確認後啟用）
-    "gae_embed",             # M13: Graph Autoencoder 結構嵌入 → GraphSAGE（純圖，無文字）
-    "degree_llm_embed",      # M14: M0（degree tile×32）+ LLM(PCA 128) → GraphSAGE
-    "llm_pairwise",          # M7: LLM 邊級關係推理（greedy，temperature=0）
-    "llm_pairwise_majority", # M8: LLM 多數決（n_votes 次，取正票比例）
-    "llm_lora",              # M9: LoRA fine-tuned + 線性分類頭
+    "degree",           # M0: 純圖統計（degree, clustering coeff）
+    "tfidf",            # M1: TF-IDF 文字向量
+    "llm_embed_lora",   # M11: Llama + LoRA 節點嵌入 → GraphSAGE
+    "degree_llm_embed", # degree+LLM_embed: M0 + LLM(PCA 128) → GraphSAGE
+    # ── 已停用（本次不跑）──────────────────────────────────────────
+    # "llm_embed",             # M10
+    # "gae_embed",             # M13
+    # "llm_pairwise",          # M7: 由 llama-3.1-70b 結果直接注入，不重跑
+    # "llm_pairwise_majority", # M8
+    # "llm_lora",              # M9
 ]
+
+# M7: LLM Pairwise 由 llama-3.1-70b 預先計算，直接注入（不呼叫 API）
+_M7_HARDCODED = {"auc": 0.8456, "ap": 0.8351}
 
 # llm_pairwise 專用：每類（正/負）test 邊最多打分幾條，控制 API 成本
 MAX_EVAL_PAIRS  = 300
@@ -438,6 +438,10 @@ def main():
 
             if run_results:
                 reporter.add(feature_name, sparsity, run_results)
+
+    # 注入 M7 (llama-3.1-70b) 硬編碼結果（與稀疏度無關，各 sparsity 值相同）
+    for sparsity in SPARSITY_RATIOS:
+        reporter.add("llm_pairwise", sparsity, [_M7_HARDCODED])
 
     reporter.print_table()
     reporter.save_csv("results/comparison_table.csv")

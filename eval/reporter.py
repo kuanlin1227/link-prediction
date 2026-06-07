@@ -20,7 +20,7 @@ FEATURE_LABELS = {
     "llm_graph_embed":       "llm+GAE+GNN",
     "gae_embed":             "GAE+GNN",
     "degree_llm_embed":      "Degree+LLM+GNN",
-    "llm_pairwise":          "llm_pairwise",
+    "llm_pairwise":          "M7: LLM Pairwise (70b)",
     "llm_pairwise_majority": "llm_majority",
     "llm_lora":              "llm_lora",
 }
@@ -121,6 +121,7 @@ class Reporter:
         os.makedirs(out_dir, exist_ok=True)
         self._plot_bar_by_sparsity(out_dir)
         self._plot_llm_gain(out_dir)
+        self._plot_sparsity_line(out_dir)
 
     # ── 圖一：各稀疏度下的 AUC 比較 ──────────────────────────────────
     def _plot_bar_by_sparsity(self, out_dir):
@@ -162,7 +163,57 @@ class Reporter:
         plt.close(fig)
         print(f"[reporter] 圖表已存至 {path}")
 
-    # ── 圖二：LLM 特徵的邊際增益（vs TF-IDF baseline）────────────────
+    # ── 圖二：AUC vs Sparsity 線圖 ───────────────────────────────────
+    def _plot_sparsity_line(self, out_dir):
+        """各方法的 AUC 隨稀疏度變化的折線圖，M7 以虛線呈現（與稀疏度無關）。"""
+        sparsities = sorted(set(r['sparsity'] for r in self.records))
+        features   = list(dict.fromkeys(r['feature'] for r in self.records))
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+        for feat in features:
+            aucs, stds, xs = [], [], []
+            for sp in sparsities:
+                rec = next((r for r in self.records
+                            if r['feature'] == feat and r['sparsity'] == sp), None)
+                if rec:
+                    aucs.append(rec['auc_mean'])
+                    stds.append(rec['auc_std'])
+                    xs.append(sp)
+            if not aucs:
+                continue
+            label  = FEATURE_LABELS.get(feat, feat)
+            color  = COLORS.get(feat, '#999')
+            is_m7  = feat == 'llm_pairwise'
+            ax.errorbar(
+                xs, aucs, yerr=stds,
+                marker='s' if is_m7 else 'o',
+                label=label, color=color,
+                linewidth=2, markersize=7, capsize=4,
+                linestyle='--' if is_m7 else '-',
+                alpha=0.9,
+            )
+
+        ax.set_xlabel("Training Edge Ratio (Graph Sparsity)", fontsize=12)
+        ax.set_ylabel("AUC-ROC", fontsize=12)
+        ax.set_title(
+            "Link Prediction AUC vs Graph Sparsity\n(GraphSAGE on ogbn-arxiv subset)",
+            fontsize=13,
+        )
+        ax.set_xticks(sparsities)
+        ax.set_xticklabels([SPARSITY_LABELS.get(s, str(s)) for s in sparsities])
+        ax.set_ylim(0.5, 1.0)
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
+        ax.legend(fontsize=10, loc='lower right')
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+
+        path = os.path.join(out_dir, "sparsity.png")
+        fig.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f"[reporter] 圖表已存至 {path}")
+
+    # ── 圖三：LLM 特徵的邊際增益（vs TF-IDF baseline）────────────────
     def _plot_llm_gain(self, out_dir):
         sparsities = sorted(set(r['sparsity'] for r in self.records))
         llm_feats  = ["e5_small"]
