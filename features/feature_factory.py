@@ -70,6 +70,225 @@ class FeatureFactory:
     def _build_e5_small(self) -> torch.Tensor:
         return self._build_sentence_transformer("intfloat/multilingual-e5-small")
 
+    # ── M10: Llama-3.1-8B-Instruct 節點嵌入 → GraphSAGE ─────────────
+    def _build_llm_embed(self) -> torch.Tensor:
+        from features.llm_embed import get_embeddings
+        texts = self._load_texts()
+        embs  = get_embeddings(texts, tag=self._dataset_tag)
+        return torch.tensor(embs, dtype=torch.float)
+
+    # ── M11: Llama + LoRA 節點嵌入 → GraphSAGE ───────────────────────
+    def _build_llm_embed_lora(self) -> torch.Tensor:
+        from features.llm_embed import get_embeddings_lora
+        texts = self._load_texts()
+        embs  = get_embeddings_lora(texts, tag=self._dataset_tag)
+        return torch.tensor(embs, dtype=torch.float)
+
+    # ── Spectral 圖結構嵌入（內部輔助，供 M12 使用）────────────────
+    def _build_struct_embed(self) -> torch.Tensor:
+        """正規化 Laplacian 的前 128 個非零特徵向量作為圖結構嵌入（Spectral Embedding）。
+        只依賴 scipy，不需要 torch-cluster / pyg-lib 等需要編譯的套件。
+        注意：使用完整圖（data_full）邊，屬 transductive 設定。
+        """
+        tag        = self._dataset_tag
+        cache_path = f"data/{tag}_spectral_embed.npy"
+        EMBED_DIM  = 128
+
+        if os.path.exists(cache_path):
+            arr = np.load(cache_path)
+            if arr.shape[0] == self.data.num_nodes:
+                print(f"[struct_embed] 載入快取: {cache_path} {arr.shape}")
+                return torch.tensor(arr, dtype=torch.float)
+
+        from scipy.sparse import coo_matrix, diags, eye
+        from scipy.sparse.linalg import eigsh
+        from sklearn.preprocessing import normalize as sk_normalize
+
+        n  = self.data.num_nodes
+        ei = self.data.edge_index.cpu().numpy()
+
+        # 無向圖 adjacency matrix（0/1，去除重複邊）
+        src = np.concatenate([ei[0], ei[1]])
+        dst = np.concatenate([ei[1], ei[0]])
+        A   = coo_matrix((np.ones(len(src)), (src, dst)), shape=(n, n)).tocsr()
+        A   = (A > 0).astype(np.float32)
+
+        # 正規化 Laplacian: L_sym = I − D^{-½} A D^{-½}
+        deg        = np.array(A.sum(axis=1)).flatten()
+        d_inv_sqrt = np.where(deg > 0, 1.0 / np.sqrt(deg), 0.0)
+        D_inv_sqrt = diags(d_inv_sqrt)
+        L_sym      = eye(n, format="csr") - D_inv_sqrt @ A @ D_inv_sqrt
+
+        k = min(EMBED_DIM + 4, n - 1)   # 多求幾個以防前幾個是零特徵值
+        print(f"[struct_embed] 計算 Laplacian 前 {k} 個特徵向量（{n} 節點）...")
+        vals, vecs = eigsh(L_sym, k=k, which="SM", tol=1e-3, maxiter=3000)
+
+        # 排序，跳過特徵值 ≈ 0（對應常數向量，不含結構資訊）
+        order      = np.argsort(vals)
+        nontrivial = [i for i in order if vals[i] > 1e-6][:EMBED_DIM]
+        embs       = vecs[:, nontrivial].astype(np.float32)   # (N, ≤128)
+
+        embs = sk_normalize(embs, norm="l2").astype(np.float32)
+        np.save(cache_path, embs)
+        print(f"[struct_embed] 完成：{embs.shape[1]} 維譜嵌入存至 {cache_path}")
+        return torch.tensor(embs, dtype=torch.float)
+
+    # ── M13: Graph Autoencoder 結構嵌入 → GraphSAGE ──────────────────
+    def _build_gae_embed(self) -> torch.Tensor:
+        """GCN 編碼器（常數初始特徵）+ 內積解碼器，以 link reconstruction 訓練。
+        輸入為 all-ones，讓 GCN 純粹從圖拓樸推導結構嵌入，不依賴任何文字或手工特徵。
+        注意：使用完整圖（data_full）邊，屬 transductive 設定。
+        快取：data/{tag}_gae_embed.npy
+        """
+        tag        = self._dataset_tag
+        cache_path = f"data/{tag}_gae_embed.npy"
+        EMBED_DIM  = 128
+        HIDDEN     = 256
+        EPOCHS     = 150
+        LR         = 0.01
+
+        if os.path.exists(cache_path):
+            arr = np.load(cache_path)
+            if arr.shape[0] == self.data.num_nodes:
+                print(f"[gae_embed] 載入快取: {cache_path} {arr.shape}")
+                return torch.tensor(arr, dtype=torch.float)
+
+        import torch.nn.functional as F
+        from torch_geometric.nn import GCNConv
+        from torch_geometric.utils import negative_sampling
+
+        n          = self.data.num_nodes
+        edge_index = self.data.edge_index.to(self.device)
+
+        # 常數初始特徵：讓 GCN 純粹從鄰域聚合學習結構嵌入
+        x = torch.ones(n, 1, dtype=torch.float, device=self.device)
+
+        class _GCNEncoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv1 = GCNConv(1, HIDDEN)
+                self.conv2 = GCNConv(HIDDEN, EMBED_DIM)
+
+            def forward(self, x, edge_index):
+                h = F.relu(self.conv1(x, edge_index))
+                return self.conv2(h, edge_index)
+
+        encoder   = _GCNEncoder().to(self.device)
+        optimizer = torch.optim.Adam(encoder.parameters(), lr=LR)
+
+        print(f"[gae_embed] 訓練 GAE（{n} 節點, {EMBED_DIM} 維, {EPOCHS} epochs）...")
+
+        for epoch in range(1, EPOCHS + 1):
+            encoder.train()
+            optimizer.zero_grad()
+            z = encoder(x, edge_index)
+
+            pos_score = (z[edge_index[0]] * z[edge_index[1]]).sum(dim=1)
+            neg_ei    = negative_sampling(
+                edge_index, num_nodes=n,
+                num_neg_samples=edge_index.shape[1],
+            )
+            neg_score = (z[neg_ei[0]] * z[neg_ei[1]]).sum(dim=1)
+
+            labels = torch.cat([
+                torch.ones(pos_score.shape[0], device=self.device),
+                torch.zeros(neg_score.shape[0], device=self.device),
+            ])
+            loss = F.binary_cross_entropy_with_logits(
+                torch.cat([pos_score, neg_score]), labels
+            )
+            loss.backward()
+            optimizer.step()
+
+            if epoch % 30 == 0:
+                print(f"[gae_embed] epoch {epoch:3d}/{EPOCHS}  loss={loss.item():.4f}")
+
+        encoder.eval()
+        with torch.no_grad():
+            z = encoder(x, edge_index)
+
+        embs  = z.cpu().numpy().astype(np.float32)
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        embs  = embs / norms
+
+        np.save(cache_path, embs)
+        print(f"[gae_embed] 完成：{EMBED_DIM} 維 GAE 嵌入存至 {cache_path}")
+        return torch.tensor(embs, dtype=torch.float)
+
+    # ── M14: M0（degree stats）+ LLM embedding → GraphSAGE ───────────
+    def _build_degree_llm_embed(self) -> torch.Tensor:
+        """degree stats (4 dim, L2-norm → tile×32 → 128 dim)
+        + Llama-3.1-8B PCA 嵌入 (4096 → 128 dim) 對等拼接 → 256 dim。
+        兩個 block 都是 128 dim，GraphSAGE 第一層各獲得相同參數配額。
+        快取：data/{tag}_llama_embed_pca128.npy（與 llm_graph_embed 共用）
+        """
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import normalize as sk_normalize
+
+        tag       = self._dataset_tag
+        pca_cache = f"data/{tag}_llama_embed_pca128.npy"
+
+        if os.path.exists(pca_cache):
+            llm_pca = np.load(pca_cache)
+            print(f"[degree_llm_embed] 載入 PCA-LLM 快取: {pca_cache} {llm_pca.shape}")
+        else:
+            llm_np  = self.get("llm_embed").cpu().numpy()
+            print("[degree_llm_embed] PCA 4096 → 128 中...")
+            pca     = PCA(n_components=128, random_state=42)
+            llm_pca = pca.fit_transform(llm_np).astype(np.float32)
+            var_exp = pca.explained_variance_ratio_.sum()
+            print(f"[degree_llm_embed] PCA 完成，保留變異量 {var_exp:.1%}")
+            llm_pca = sk_normalize(llm_pca, norm="l2").astype(np.float32)
+            np.save(pca_cache, llm_pca)
+
+        # degree block: 4 dim → L2-normalize → tile ×32 → 128 dim
+        # isolated nodes（degree=0，cold-start 下的冷節點）的 degree block 強制歸零：
+        # StandardScaler 會把 degree=0 轉成非零負值，L2-norm 後形成所有冷節點都相同
+        # 的常數模式，佔用 50% feature space 卻不含節點區分資訊，稀釋 LLM 信號。
+        # 歸零後冷節點退化為純 LLM 特徵，train 節點保留 degree + LLM 兩個 block。
+        from torch_geometric.utils import degree as pyg_degree
+        node_deg     = pyg_degree(self.data.edge_index[0],
+                                  num_nodes=self.data.num_nodes).cpu().numpy()
+        isolated     = node_deg == 0                                  # cold node mask
+
+        degree_np    = self.get("degree").cpu().numpy()               # (N, 4)
+        degree_l2    = sk_normalize(degree_np, norm="l2").astype(np.float32)
+        degree_l2[isolated] = 0.0                                     # cold → zero block
+        degree_tiled = np.tile(degree_l2, (1, 32))                    # (N, 128)
+
+        combined = np.concatenate([llm_pca, degree_tiled], axis=1)    # (N, 256)
+        return torch.tensor(combined, dtype=torch.float)
+
+    # ── M12: LLM embedding + Spectral embedding → GraphSAGE ──────────
+    def _build_llm_graph_embed(self) -> torch.Tensor:
+        """凍結 Llama-3.1-8B 文字嵌入（PCA → 128 維）+ Laplacian 譜嵌入（128 維）
+        維度對等後拼接，輸入 GraphSAGE，讓模型同時看到語意與拓樸資訊。
+        快取：data/{tag}_llama_embed_pca128.npy
+        """
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import normalize as sk_normalize
+
+        tag       = self._dataset_tag
+        pca_cache = f"data/{tag}_llama_embed_pca128.npy"
+
+        if os.path.exists(pca_cache):
+            llm_pca = np.load(pca_cache)
+            print(f"[llm_graph_embed] 載入 PCA-LLM 快取: {pca_cache} {llm_pca.shape}")
+        else:
+            llm_np  = self.get("llm_embed").cpu().numpy()   # (N, 4096)
+            print("[llm_graph_embed] PCA 4096 → 128 中...")
+            pca     = PCA(n_components=128, random_state=42)
+            llm_pca = pca.fit_transform(llm_np).astype(np.float32)
+            var_exp = pca.explained_variance_ratio_.sum()
+            print(f"[llm_graph_embed] PCA 完成，保留變異量 {var_exp:.1%}")
+            llm_pca = sk_normalize(llm_pca, norm="l2").astype(np.float32)
+            np.save(pca_cache, llm_pca)
+
+        struct_np = self.get("gae_embed").cpu().numpy()       # (N, 128)
+        combined  = np.concatenate([llm_pca, struct_np], axis=1)  # (N, 256)
+        return torch.tensor(combined, dtype=torch.float)
+
     # ── M5: LLM 關鍵詞 + TF-IDF ─────────────────────────────────────
     def _build_llm_keywords(self) -> torch.Tensor:
         """Groq 為每篇論文生成 10 個技術關鍵詞，再做 TF-IDF 向量化"""

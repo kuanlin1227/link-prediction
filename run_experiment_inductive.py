@@ -36,7 +36,12 @@ VAL_RATIO    = 0.1               # 驗證節點佔比（用於 early stopping）
 RESULT_DIR   = "results_inductive"
 
 # 走 GraphSAGE 的特徵（節點特徵 → GNN）
-GNN_FEATURES = ["degree", "tfidf", "e5_small"]  # "llm_keywords" 已停用
+GNN_FEATURES = [
+    "degree",            # M0: 純圖統計 → 冷節點 degree=0，退化為零向量
+    "e5_small",          # M2: 輕量 LLM（與圖無關，冷節點有完整嵌入）
+    "llm_embed",         # M10: Llama-3.1-8B（與圖無關，冷節點有完整嵌入）
+    "degree_llm_embed",  # M14: M0 + LLM(PCA) → LLM 補償冷節點零 degree
+]
 # 邊級 LLM 推理（不經 GNN，與圖結構無關）
 PAIRWISE_FEATURE = "llm_pairwise"
 

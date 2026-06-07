@@ -11,11 +11,18 @@ import matplotlib.ticker as mticker
 
 
 FEATURE_LABELS = {
-    "degree":       "M0: Degree Stats",
-    "tfidf":        "M1: TF-IDF",
-    "e5_small":     "M2: E5-Small (LLM)",
-    "llm_keywords": "M6: LLM Keywords",
-    "llm_pairwise": "M7: LLM Pairwise",
+    "degree":                "M0: Degree Stats",
+    "tfidf":                 "M1: TF-IDF",
+    "e5_small":              "M2: E5-Small (LLM)",
+    "llm_keywords":          "M6: LLM Keywords",
+    "llm_embed":             "llm_embed+GNN",
+    "llm_embed_lora":        "llm_embed_lora+GNN",
+    "llm_graph_embed":       "llm+GAE+GNN",
+    "gae_embed":             "GAE+GNN",
+    "degree_llm_embed":      "Degree+LLM+GNN",
+    "llm_pairwise":          "llm_pairwise",
+    "llm_pairwise_majority": "llm_majority",
+    "llm_lora":              "llm_lora",
 }
 
 SPARSITY_LABELS = {
@@ -25,11 +32,18 @@ SPARSITY_LABELS = {
 }
 
 COLORS = {
-    "degree":       "#6B7280",
-    "tfidf":        "#F59E0B",
-    "e5_small":     "#3B82F6",
-    "llm_keywords": "#EC4899",
-    "llm_pairwise": "#EF4444",
+    "degree":                "#6B7280",
+    "tfidf":                 "#F59E0B",
+    "e5_small":              "#3B82F6",
+    "llm_keywords":          "#EC4899",
+    "llm_embed":             "#0EA5E9",
+    "llm_embed_lora":        "#6366F1",
+    "llm_graph_embed":       "#F97316",
+    "gae_embed":             "#84CC16",
+    "degree_llm_embed":      "#D97706",
+    "llm_pairwise":          "#EF4444",
+    "llm_pairwise_majority": "#7C3AED",
+    "llm_lora":              "#10B981",
 }
 
 

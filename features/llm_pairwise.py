@@ -30,6 +30,11 @@ TEMPERATURE = 0.0     # 打分要可重現、可校準（temperature=0 → greed
 MAX_CHARS   = 180     # 每篇摘要截斷長度
 MAX_NEW_TOKENS = 768  # 一個 batch 的 JSON 陣列輸出上限
 
+# 多數決專用設定
+N_VOTES          = 5    # 每個 pair 投票次數
+VOTE_TEMPERATURE = 0.7  # 需要多樣性，改用非零 temperature
+VOTE_THRESHOLD   = 0.5  # 單次分數 >= 此值視為正票
+
 
 # ── Prompt（system）──────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
@@ -126,6 +131,80 @@ def score_pairs(pairs, texts, tag, years=None, log_prefix="[llm_pairwise]"):
     return [cache[_pair_key(u, v)] for u, v in pairs]
 
 
+def score_pairs_majority(pairs, texts, tag, years=None, n_votes=N_VOTES,
+                         log_prefix="[llm_majority]"):
+    """
+    對每個 pair 執行 n_votes 次推理（temperature=VOTE_TEMPERATURE），
+    將每次分數二值化後取多數決，回傳正票比例（0~1）作為最終分數。
+
+    快取：data/{tag}_llm_majority_votes.json，key = "min,max"，
+    value = list[float]（每次推理的原始分數），長度達 n_votes 即完整。
+    """
+    cache_path = f"data/{tag}_llm_majority_votes.json"
+    cache = {}
+    if os.path.exists(cache_path):
+        with open(cache_path, encoding="utf-8") as f:
+            cache = json.load(f)
+
+    # 找出還沒打滿 n_votes 票的 pair（去重）
+    seen, todo = set(), []
+    for u, v in pairs:
+        k = _pair_key(u, v)
+        if len(cache.get(k, [])) < n_votes and k not in seen:
+            seen.add(k)
+            todo.append((u, v))
+
+    if todo:
+        model, tokenizer, device = _get_model()
+
+        # 最多需要補幾輪（每輪把所有不足的 pair 打一次）
+        max_rounds = max(
+            n_votes - len(cache.get(_pair_key(u, v), []))
+            for u, v in todo
+        )
+
+        for rnd in range(max_rounds):
+            # 本輪仍需補票的 pair
+            round_todo = [(u, v) for u, v in todo
+                          if len(cache.get(_pair_key(u, v), [])) < n_votes]
+            if not round_todo:
+                break
+
+            n_batch = (len(round_todo) + BATCH - 1) // BATCH
+            print(f"{log_prefix} round {rnd+1}/{max_rounds}，"
+                  f"{len(round_todo)} 個 pair，{n_batch} batch"
+                  f"（temperature={VOTE_TEMPERATURE}）")
+
+            for b in range(n_batch):
+                lo, hi = b * BATCH, min((b + 1) * BATCH, len(round_todo))
+                batch = round_todo[lo:hi]
+                pairs_block = "\n\n".join(
+                    _format_pair(i, u, v, texts, years)
+                    for i, (u, v) in enumerate(batch)
+                )
+                scores = _call_batch(model, tokenizer, device,
+                                     pairs_block, len(batch), log_prefix, b,
+                                     temperature=VOTE_TEMPERATURE)
+                for (u, v), s in zip(batch, scores):
+                    cache.setdefault(_pair_key(u, v), []).append(s)
+
+                if (b + 1) % 10 == 0 or hi == len(round_todo):
+                    _save(cache_path, cache)
+
+        _save(cache_path, cache)
+
+    # 多數決：正票比例 = 分數 >= VOTE_THRESHOLD 的次數 / n_votes
+    results = []
+    for u, v in pairs:
+        votes = cache.get(_pair_key(u, v), [])[:n_votes]
+        if votes:
+            pos_frac = sum(1 for s in votes if s >= VOTE_THRESHOLD) / len(votes)
+        else:
+            pos_frac = 0.5
+        results.append(pos_frac)
+    return results
+
+
 # ── 模型載入（單例，整個 process 只載一次）────────────────────────────
 _MODEL_CACHE = {}
 
@@ -187,9 +266,13 @@ def _clip01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 
-def _call_batch(model, tokenizer, device, pairs_block, n_pairs, log_prefix, b):
+def _call_batch(model, tokenizer, device, pairs_block, n_pairs, log_prefix, b,
+                temperature=None):
     """本地推理一個 batch，回傳長度 = n_pairs 的分數（解析失敗填 0.5 中性值）"""
     import torch
+
+    if temperature is None:
+        temperature = TEMPERATURE
 
     user_msg = (
         f"NOW SCORE THESE PAIRS:\n{pairs_block}\n\n"
@@ -210,8 +293,8 @@ def _call_batch(model, tokenizer, device, pairs_block, n_pairs, log_prefix, b):
             out = model.generate(
                 inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=TEMPERATURE > 0,
-                temperature=TEMPERATURE if TEMPERATURE > 0 else None,
+                do_sample=temperature > 0,
+                temperature=temperature if temperature > 0 else None,
                 pad_token_id=tokenizer.pad_token_id,
             )
         # 只取新生成的部分（去掉 prompt）
@@ -225,6 +308,14 @@ def _call_batch(model, tokenizer, device, pairs_block, n_pairs, log_prefix, b):
     except Exception as e:
         print(f"{log_prefix} batch {b:4d} | 失敗: {e}")
         return [0.5] * n_pairs
+
+
+def clear_model_cache():
+    """釋放 GPU 記憶體，讓後續方法可重新載入不同模型。"""
+    _MODEL_CACHE.clear()
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _parse_scores(raw: str, n_pairs: int):

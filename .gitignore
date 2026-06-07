@@ -1,5 +1,6 @@
 # Datasets (download separately, too large for GitHub)
 data/
+record/
 
 # Python
 __pycache__/
