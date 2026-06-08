@@ -260,6 +260,44 @@ class FeatureFactory:
         combined = np.concatenate([llm_pca, degree_tiled], axis=1)    # (N, 256)
         return torch.tensor(combined, dtype=torch.float)
 
+    # ── M14b: M0（degree stats）+ LoRA-LLM embedding → GraphSAGE ──────
+    def _build_degree_llm_embed_lora(self) -> torch.Tensor:
+        """degree stats + Llama-3.1-8B+LoRA PCA 嵌入（128+128=256 dim）。
+        與 degree_llm_embed 結構相同，但使用 LoRA fine-tuned LLM 嵌入。
+        快取：data/{tag}_llama_lora_embed_pca128.npy
+        """
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import normalize as sk_normalize
+
+        tag       = self._dataset_tag
+        pca_cache = f"data/{tag}_llama_lora_embed_pca128.npy"
+
+        if os.path.exists(pca_cache):
+            llm_pca = np.load(pca_cache)
+            print(f"[degree_llm_embed_lora] 載入 PCA-LoRA-LLM 快取: {pca_cache} {llm_pca.shape}")
+        else:
+            llm_np  = self.get("llm_embed_lora").cpu().numpy()
+            print("[degree_llm_embed_lora] PCA 4096 → 128 中...")
+            pca     = PCA(n_components=128, random_state=42)
+            llm_pca = pca.fit_transform(llm_np).astype(np.float32)
+            var_exp = pca.explained_variance_ratio_.sum()
+            print(f"[degree_llm_embed_lora] PCA 完成，保留變異量 {var_exp:.1%}")
+            llm_pca = sk_normalize(llm_pca, norm="l2").astype(np.float32)
+            np.save(pca_cache, llm_pca)
+
+        from torch_geometric.utils import degree as pyg_degree
+        node_deg     = pyg_degree(self.data.edge_index[0],
+                                  num_nodes=self.data.num_nodes).cpu().numpy()
+        isolated     = node_deg == 0
+
+        degree_np    = self.get("degree").cpu().numpy()
+        degree_l2    = sk_normalize(degree_np, norm="l2").astype(np.float32)
+        degree_l2[isolated] = 0.0
+        degree_tiled = np.tile(degree_l2, (1, 32))
+
+        combined = np.concatenate([llm_pca, degree_tiled], axis=1)    # (N, 256)
+        return torch.tensor(combined, dtype=torch.float)
+
     # ── M12: LLM embedding + Spectral embedding → GraphSAGE ──────────
     def _build_llm_graph_embed(self) -> torch.Tensor:
         """凍結 Llama-3.1-8B 文字嵌入（PCA → 128 維）+ Laplacian 譜嵌入（128 維）

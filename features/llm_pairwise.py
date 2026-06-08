@@ -78,6 +78,31 @@ Output ONLY a JSON array, one object per pair, preserving the given id:
 Output the JSON array and nothing else."""
 
 
+PRODUCTS_SYSTEM_PROMPT = """\
+You are an expert in e-commerce product recommendation and consumer behavior analysis.
+For each PAIR of products, output the probability (0.00-1.00) that these two products \
+are frequently co-purchased together by the same customers.
+
+A co-purchase link means customers who buy one product also tend to buy the other. \
+This reflects COMPLEMENTARY use or RELATED needs, not mere similarity: \
+different-category items can be strongly linked (e.g., phone + phone case), \
+and similar items may rarely be co-purchased (competing alternatives).
+
+Consider: complementary use (accessories, consumables, bundled items); same activity or hobby; \
+problem-solution pairs; brand ecosystems; sequential use (buy item A → need item B).
+Generic category overlap ("both are electronics") is WEAK; specific complementary utility is STRONG.
+
+Score guide: 0.90-1.00 clear complementary pair, very commonly bought together; \
+0.70-0.89 related use case, plausibly co-purchased; 0.45-0.69 related category but uncertain; \
+0.20-0.44 same broad category only; 0.00-0.19 unrelated products.
+Use the full range and fine values (e.g. 0.63); never round to 0 or 1. \
+Most random pairs should score low.
+
+Output ONLY a JSON array, one object per pair, preserving the given id:
+[{"id":1,"score":0.74}, ...]
+Output the JSON array and nothing else."""
+
+
 # ── 對外介面 ──────────────────────────────────────────────────────────
 def score_pairs(pairs, texts, tag, years=None, log_prefix="[llm_pairwise]"):
     """
@@ -308,6 +333,88 @@ def _call_batch(model, tokenizer, device, pairs_block, n_pairs, log_prefix, b,
     except Exception as e:
         print(f"{log_prefix} batch {b:4d} | 失敗: {e}")
         return [0.5] * n_pairs
+
+
+def score_pairs_groq(pairs, texts, tag, system_prompt=None,
+                     model="llama-3.3-70b-versatile",
+                     log_prefix="[llm_pairwise_groq]"):
+    """用 Groq API 對 pairs 打分，結果快取至 data/{tag}_groq_pairwise_scores.json。"""
+    import time
+    from groq import Groq
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError(f"{log_prefix} 需要設定 GROQ_API_KEY 環境變數")
+
+    if system_prompt is None:
+        system_prompt = SYSTEM_PROMPT
+
+    client     = Groq(api_key=api_key)
+    cache_path = f"data/{tag}_groq_pairwise_scores.json"
+    cache      = {}
+    if os.path.exists(cache_path):
+        with open(cache_path, encoding="utf-8") as f:
+            cache = json.load(f)
+
+    todo, seen = [], set()
+    for u, v in pairs:
+        k = _pair_key(u, v)
+        if k not in cache and k not in seen:
+            seen.add(k)
+            todo.append((u, v))
+
+    if todo:
+        n_batch = (len(todo) + BATCH - 1) // BATCH
+        print(f"{log_prefix} 需打分 {len(todo)} 個新 pair，共 {n_batch} batch"
+              f"（model={model}）")
+
+        for b in range(n_batch):
+            lo, hi = b * BATCH, min((b + 1) * BATCH, len(todo))
+            batch  = todo[lo:hi]
+            pairs_block = "\n\n".join(
+                _format_pair(i, u, v, texts, None)
+                for i, (u, v) in enumerate(batch)
+            )
+            user_msg = (
+                f"NOW SCORE THESE PAIRS:\n{pairs_block}\n\n"
+                f"Output ONLY the JSON array of {len(batch)} objects."
+            )
+
+            scores = [0.5] * len(batch)
+            for attempt in range(3):
+                try:
+                    resp = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user",   "content": user_msg},
+                        ],
+                        temperature=0,
+                        max_tokens=512,
+                    )
+                    raw    = resp.choices[0].message.content.strip()
+                    parsed = _parse_scores(raw, len(batch))
+                    scores = [s if s is not None else 0.5 for s in parsed]
+                    filled = sum(1 for s in parsed if s is not None)
+                    print(f"{log_prefix} batch {b:4d} | {filled}/{len(batch)} 筆")
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        time.sleep(4 * (attempt + 1))
+                    else:
+                        print(f"{log_prefix} batch {b:4d} | 失敗: {e}")
+
+            for (u, v), s in zip(batch, scores):
+                cache[_pair_key(u, v)] = s
+
+            if (b + 1) % 5 == 0 or hi == len(todo):
+                _save(cache_path, cache)
+
+            time.sleep(2.5)  # Groq rate limit: 30 RPM
+
+        _save(cache_path, cache)
+
+    return [cache[_pair_key(u, v)] for u, v in pairs]
 
 
 def clear_model_cache():

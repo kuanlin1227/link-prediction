@@ -1,9 +1,9 @@
 """
-Cold-Start (Inductive) Link Prediction
+Cold-Start (Inductive) Link Prediction on ogbn-products (TAPE subset)
 研究問題：當「新節點」在訓練時完全沒出現過（degree=0、無任何鄰居），
           純圖結構特徵（M0）會失效，而文字 / LLM 特徵是否仍然有效？
 
-與 run_experiment.py（transductive）的差別：
+與 run_experiment_products.py（transductive）的差別：
   - transductive：藏「邊」，所有節點訓練時都看得到 → RandomLinkSplit
   - inductive   ：藏「整個節點」，冷節點及其所有邊在訓練時被移除（本檔）
 
@@ -12,7 +12,7 @@ Cold-Start (Inductive) Link Prediction
   - 訊息傳遞圖只保留「兩端都是 train」的邊；冷節點在訓練圖中是孤立點
   - 節點特徵在「訓練圖」上計算 → M0 對冷節點退化為 0；文字特徵與圖無關照常可用
   - 測試正邊 = 至少一端是冷節點的真實邊；測試負邊 = 等量隨機非邊
-  - 結果寫入獨立資料夾 results_inductive/（不影響 transductive 結果）
+  - 結果寫入 results_inductive_products/（不影響 transductive 結果）
 """
 
 import os
@@ -21,28 +21,25 @@ import torch
 from torch_geometric.data import Data
 from sklearn.metrics import roc_auc_score, average_precision_score
 
-# 重用 run_experiment 的資料載入、模型、設定（import 時會套用其 torch.load patch）
-from run_experiment import (load_dataset, DEVICE, EPOCHS, LR, HIDDEN, OUT_DIM,
-                            RUNS, DATASET_TAG, USE_YEAR_FEATURE,
-                            YEAR_MIN, YEAR_MAX)
+from run_experiment_products import (
+    load_dataset, DEVICE, EPOCHS, LR, HIDDEN, OUT_DIM, RUNS, DATASET_TAG
+)
 from features.feature_factory import FeatureFactory
 from models.graphsage import LinkSAGE, train_epoch, evaluate
 from eval.reporter import FEATURE_LABELS, COLORS
 
 
 # ── 設定 ──────────────────────────────────────────────────────────────
-COLD_RATIOS  = [0.1, 0.2, 0.4]   # 掃描：冷節點（測試）佔比；訓練時整個移除
-VAL_RATIO    = 0.1               # 驗證節點佔比（用於 early stopping）
-RESULT_DIR   = "results_inductive"
+COLD_RATIOS = [0.1, 0.2, 0.4]   # 冷節點（測試）佔比；訓練時整個移除
+VAL_RATIO   = 0.1               # 驗證節點佔比
+RESULT_DIR  = "results_inductive_products"
 
-# 走 GraphSAGE 的特徵（節點特徵 → GNN）— 與 transductive 對齊
 GNN_FEATURES = [
     "degree",                # M0: 純圖統計 → 冷節點 degree=0，退化為零向量
-    "tfidf",                 # M1: TF-IDF 文字向量（與圖無關，冷節點有完整向量）
+    "tfidf",                 # M1: TF-IDF 商品文字（與圖無關，冷節點有完整向量）
     "llm_embed_lora",        # M11: Llama + LoRA（與圖無關，冷節點有完整嵌入）
     "degree_llm_embed_lora", # degree + LoRA-LLM embed → LLM 補償冷節點零 degree
 ]
-PAIRWISE_FEATURE = "llm_pairwise"
 
 
 # ── Inductive 切分 ────────────────────────────────────────────────────
@@ -51,20 +48,19 @@ def inductive_split(data, cold_ratio, val_ratio, seed):
     N   = data.num_nodes
     gen = torch.Generator().manual_seed(seed)
 
-    perm    = torch.randperm(N, generator=gen)
-    n_cold  = int(N * cold_ratio)
-    n_val   = int(N * val_ratio)
+    perm       = torch.randperm(N, generator=gen)
+    n_cold     = int(N * cold_ratio)
+    n_val      = int(N * val_ratio)
     cold_nodes = perm[:n_cold]
     val_nodes  = perm[n_cold:n_cold + n_val]
 
-    is_cold = torch.zeros(N, dtype=torch.bool); is_cold[cold_nodes] = True
-    is_val  = torch.zeros(N, dtype=torch.bool); is_val[val_nodes]   = True
+    is_cold  = torch.zeros(N, dtype=torch.bool); is_cold[cold_nodes] = True
+    is_val   = torch.zeros(N, dtype=torch.bool); is_val[val_nodes]   = True
     is_train = ~(is_cold | is_val)
 
     ei   = data.edge_index
     s, d = ei[0], ei[1]
 
-    # 三類正邊：train 內部 / 觸及 val（不觸 cold）/ 觸及 cold
     train_mask = is_train[s] & is_train[d]
     val_mask   = (is_val[s] | is_val[d]) & ~(is_cold[s] | is_cold[d])
     cold_mask  = is_cold[s] | is_cold[d]
@@ -73,17 +69,14 @@ def inductive_split(data, cold_ratio, val_ratio, seed):
     val_pos   = ei[:, val_mask]
     cold_pos  = ei[:, cold_mask]
 
-    # 訊息傳遞圖：對稱化的 train 邊（冷節點在此圖中為孤立點）
+    # 訊息傳遞圖：對稱化的 train 邊
     mp_edge_index = torch.cat([train_pos, train_pos.flip(0)], dim=1)
 
-    # 無向 existing set，供負邊取樣排除
     existing = set()
-    sl, dl = s.tolist(), d.tolist()
-    for a, b in zip(sl, dl):
+    for a, b in zip(s.tolist(), d.tolist()):
         existing.add((a, b)); existing.add((b, a))
 
     def _sample_neg(k, kind):
-        """取 k 條符合 kind 條件的非邊（無向去重）"""
         out, seen = [], set()
         guard = 0
         while len(out) < k and guard < 200:
@@ -99,7 +92,7 @@ def inductive_split(data, cold_ratio, val_ratio, seed):
                     ok = bool(is_train[u]) and bool(is_train[v])
                 elif kind == "val":
                     ok = (bool(is_val[u]) or bool(is_val[v])) and not (bool(is_cold[u]) or bool(is_cold[v]))
-                else:  # cold
+                else:
                     ok = bool(is_cold[u]) or bool(is_cold[v])
                 if not ok:
                     continue
@@ -124,30 +117,22 @@ def inductive_split(data, cold_ratio, val_ratio, seed):
     }
 
 
-# ── 單次實驗：GNN 特徵 ─────────────────────────────────────────────────
+# ── 單次實驗 ───────────────────────────────────────────────────────────
 def run_one_inductive(data_full, texts, feature_name, cold_ratio, run_id):
     sp = inductive_split(data_full, cold_ratio, VAL_RATIO, seed=run_id)
     N  = sp["num_nodes"]
 
-    # 特徵在「訓練圖」上計算 → M0 對冷節點退化；文字特徵與圖無關（讀磁碟快取）
     train_graph = Data(edge_index=sp["mp_edge_index"], num_nodes=N)
     factory     = FeatureFactory(train_graph, DEVICE, texts=texts,
                                  dataset_tag=DATASET_TAG)
     x           = factory.get(feature_name)
-
-    # 與主實驗一致：把發表年份當額外一維特徵併入（min-max 正規化到 0~1）
-    if USE_YEAR_FEATURE and getattr(data_full, "node_year", None) is not None:
-        span    = max(1, YEAR_MAX - YEAR_MIN)
-        yr_norm = ((data_full.node_year.float() - YEAR_MIN) / span).clamp(0, 1)
-        x       = torch.cat([x, yr_norm.to(x.device)], dim=1)
-
     in_channels = x.shape[1]
 
     def _data(key):
         eli, lab = sp[key]
         obj = Data()
-        obj.x               = x
-        obj.edge_index      = sp["mp_edge_index"]
+        obj.x                = x
+        obj.edge_index       = sp["mp_edge_index"]
         obj.edge_label_index = eli
         obj.edge_label       = lab
         return obj
@@ -175,56 +160,21 @@ def run_one_inductive(data_full, texts, feature_name, cold_ratio, run_id):
     return evaluate(model, train_data, cold_data, DEVICE)
 
 
-# ── 單次實驗：LLM 邊級推理（M7）──────────────────────────────────────
-def run_pairwise_inductive(data_full, texts, cold_ratio, run_id):
-    from features.llm_pairwise import score_pairs
-
-    sp       = inductive_split(data_full, cold_ratio, VAL_RATIO, seed=run_id)
-    eli, lab = sp["cold"]
-
-    gen      = torch.Generator().manual_seed(run_id)
-    pos_cols = (lab == 1).nonzero(as_tuple=True)[0]
-    neg_cols = (lab == 0).nonzero(as_tuple=True)[0]
-
-    def _cap(cols):
-        if len(cols) > MAX_EVAL_PAIRS_COLD:
-            p = torch.randperm(len(cols), generator=gen)[:MAX_EVAL_PAIRS_COLD]
-            return cols[p]
-        return cols
-
-    sel    = torch.cat([_cap(pos_cols), _cap(neg_cols)])
-    pairs  = [(int(eli[0, i]), int(eli[1, i])) for i in sel]
-    y      = lab[sel].numpy()
-    years  = (data_full.node_year.view(-1).tolist()
-              if getattr(data_full, "node_year", None) is not None else None)
-    scores = score_pairs(pairs, texts, tag=DATASET_TAG, years=years)
-    return {"auc": roc_auc_score(y, scores), "ap": average_precision_score(y, scores)}
-
-
 # ── 結果輸出 ──────────────────────────────────────────────────────────
-def save_and_plot(gnn_records, pairwise, out_dir):
-    """
-    gnn_records: dict[(feature, cold_ratio)] -> {auc_mean, auc_std, ap_mean, ap_std}
-    pairwise:    {auc, ap} 或 None（M7，與冷節點比例無關，畫成水平線）
-    """
+def save_and_plot(gnn_records, out_dir):
     import pandas as pd
     import matplotlib.pyplot as plt
     import matplotlib.ticker as mticker
 
     os.makedirs(os.path.join(out_dir, "figures"), exist_ok=True)
 
-    # CSV：列 = 特徵，欄 = 各冷節點比例的 AUC
     rows = []
     for feat in GNN_FEATURES:
         row = {"特徵方法": FEATURE_LABELS.get(feat, feat)}
         for cr in COLD_RATIOS:
             r = gnn_records.get((feat, cr))
-            row[f"Cold {cr:.0%}"] = f"{r['auc_mean']:.4f} ± {r['auc_std']:.4f}" if r else "-"
-        rows.append(row)
-    if pairwise is not None:
-        row = {"特徵方法": FEATURE_LABELS.get(PAIRWISE_FEATURE, PAIRWISE_FEATURE)}
-        for cr in COLD_RATIOS:
-            row[f"Cold {cr:.0%}"] = f"{pairwise['auc']:.4f} (圖無關)"
+            row[f"Cold {cr:.0%}"] = (f"{r['auc_mean']:.4f} ± {r['auc_std']:.4f}"
+                                     if r else "-")
         rows.append(row)
 
     df       = pd.DataFrame(rows)
@@ -232,15 +182,14 @@ def save_and_plot(gnn_records, pairwise, out_dir):
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 
     print("\n" + "=" * 72)
-    print("Cold-Start (Inductive) AUC — 掃描冷節點比例")
+    print("Cold-Start (Inductive) AUC — ogbn-products")
     print("=" * 72)
     print(df.to_string(index=False))
     print("=" * 72)
     print(f"[reporter] 結果已存至 {csv_path}")
 
-    # 趨勢圖：x = 冷節點比例，每個 GNN 特徵一條線；M7 為水平線
     fig, ax = plt.subplots(figsize=(8, 5))
-    xs = [cr for cr in COLD_RATIOS]
+    xs = list(COLD_RATIOS)
 
     for feat in GNN_FEATURES:
         ys   = [gnn_records[(feat, cr)]["auc_mean"] for cr in COLD_RATIOS
@@ -253,11 +202,6 @@ def save_and_plot(gnn_records, pairwise, out_dir):
                         label=FEATURE_LABELS.get(feat, feat),
                         color=COLORS.get(feat, "#999"))
 
-    if pairwise is not None:
-        ax.axhline(pairwise["auc"], linestyle="--", linewidth=2,
-                   color=COLORS.get(PAIRWISE_FEATURE, "#EF4444"),
-                   label=FEATURE_LABELS.get(PAIRWISE_FEATURE) + " (圖無關)")
-
     ax.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="random (0.5)")
     ax.set_xticks(xs)
     ax.set_xticklabels([f"{cr:.0%}" for cr in COLD_RATIOS])
@@ -265,7 +209,7 @@ def save_and_plot(gnn_records, pairwise, out_dir):
     ax.set_ylabel("AUC", fontsize=12)
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
     ax.set_title("Cold-Start (Inductive) Link Prediction\n"
-                 "(ogbn-arxiv) — higher cold ratio = more unseen nodes", fontsize=12)
+                 "(ogbn-products) — higher cold ratio = more unseen nodes", fontsize=12)
     ax.grid(alpha=0.3)
     ax.legend(fontsize=9)
     fig.tight_layout()
@@ -278,14 +222,15 @@ def save_and_plot(gnn_records, pairwise, out_dir):
 # ── 主流程 ────────────────────────────────────────────────────────────
 def main():
     print(f"Device: {DEVICE}\n")
+    os.makedirs(RESULT_DIR, exist_ok=True)
+
     data_full, texts = load_dataset()
-    print(f"ogbn-arxiv 子圖 — nodes: {data_full.num_nodes}, "
+    print(f"ogbn-products 子圖 — nodes: {data_full.num_nodes}, "
           f"edges: {data_full.edge_index.shape[1]}")
     print(f"Inductive 掃描：冷節點比例 {[f'{c:.0%}' for c in COLD_RATIOS]}\n")
 
     gnn_records = {}
 
-    # GNN 特徵：每個冷節點比例 × RUNS 次取平均 ± std
     for feature_name in GNN_FEATURES:
         for cr in COLD_RATIOS:
             aucs, aps = [], []
@@ -303,9 +248,8 @@ def main():
                     "ap_mean":  float(np.mean(aps)),  "ap_std":  float(np.std(aps)),
                 }
 
-    save_and_plot(gnn_records, None, RESULT_DIR)
+    save_and_plot(gnn_records, RESULT_DIR)
 
 
 if __name__ == "__main__":
-    os.makedirs(RESULT_DIR, exist_ok=True)
     main()
